@@ -41,9 +41,9 @@ func ValidateUsername(username string) error {
 	}
 
 	// Ensure the username starts with a letter
-	if !unicode.IsLetter(rune(username[0])) {
-		return errors.New("username must start with a letter")
-	}
+	// if !unicode.IsLetter(rune(username[0])) {
+	// 	return errors.New("username must start with a letter")
+	// }
 
 	atCount := 0
 	for _, char := range username {
