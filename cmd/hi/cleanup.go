@@ -3,9 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff/v5"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
@@ -14,9 +18,11 @@ import (
 )
 
 // cleanupBeforeTest performs cleanup operations before running tests.
+// Only removes stale (stopped/exited) test containers to avoid interfering with concurrent test runs.
 func cleanupBeforeTest(ctx context.Context) error {
-	if err := killTestContainers(ctx); err != nil {
-		return fmt.Errorf("failed to kill test containers: %w", err)
+	err := cleanupStaleTestContainers(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to clean stale test containers: %w", err)
 	}
 
 	if err := pruneDockerNetworks(ctx); err != nil {
@@ -26,11 +32,25 @@ func cleanupBeforeTest(ctx context.Context) error {
 	return nil
 }
 
-// cleanupAfterTest removes the test container after completion.
-func cleanupAfterTest(ctx context.Context, cli *client.Client, containerID string) error {
-	return cli.ContainerRemove(ctx, containerID, container.RemoveOptions{
+// cleanupAfterTest removes the test container and all associated integration test containers for the run.
+func cleanupAfterTest(ctx context.Context, cli *client.Client, containerID, runID string) error {
+	// Remove the main test container
+	err := cli.ContainerRemove(ctx, containerID, container.RemoveOptions{
 		Force: true,
 	})
+	if err != nil {
+		return fmt.Errorf("failed to remove test container: %w", err)
+	}
+
+	// Clean up integration test containers for this run only
+	if runID != "" {
+		err := killTestContainersByRunID(ctx, runID)
+		if err != nil {
+			return fmt.Errorf("failed to clean up containers for run %s: %w", runID, err)
+		}
+	}
+
+	return nil
 }
 
 // killTestContainers terminates and removes all test containers.
@@ -83,30 +103,122 @@ func killTestContainers(ctx context.Context) error {
 	return nil
 }
 
+// killTestContainersByRunID terminates and removes all test containers for a specific run ID.
+// This function filters containers by the hi.run-id label to only affect containers
+// belonging to the specified test run, leaving other concurrent test runs untouched.
+func killTestContainersByRunID(ctx context.Context, runID string) error {
+	cli, err := createDockerClient()
+	if err != nil {
+		return fmt.Errorf("failed to create Docker client: %w", err)
+	}
+	defer cli.Close()
+
+	// Filter containers by hi.run-id label
+	containers, err := cli.ContainerList(ctx, container.ListOptions{
+		All: true,
+		Filters: filters.NewArgs(
+			filters.Arg("label", "hi.run-id="+runID),
+		),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list containers for run %s: %w", runID, err)
+	}
+
+	removed := 0
+
+	for _, cont := range containers {
+		// Kill the container if it's running
+		if cont.State == "running" {
+			_ = cli.ContainerKill(ctx, cont.ID, "KILL")
+		}
+
+		// Remove the container with retry logic
+		if removeContainerWithRetry(ctx, cli, cont.ID) {
+			removed++
+		}
+	}
+
+	if removed > 0 {
+		fmt.Printf("Removed %d containers for run ID %s\n", removed, runID)
+	}
+
+	return nil
+}
+
+// cleanupStaleTestContainers removes stopped/exited test containers without affecting running tests.
+// This is useful for cleaning up leftover containers from previous crashed or interrupted test runs
+// without interfering with currently running concurrent tests.
+func cleanupStaleTestContainers(ctx context.Context) error {
+	cli, err := createDockerClient()
+	if err != nil {
+		return fmt.Errorf("failed to create Docker client: %w", err)
+	}
+	defer cli.Close()
+
+	// Only get stopped/exited containers
+	containers, err := cli.ContainerList(ctx, container.ListOptions{
+		All: true,
+		Filters: filters.NewArgs(
+			filters.Arg("status", "exited"),
+			filters.Arg("status", "dead"),
+		),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list stopped containers: %w", err)
+	}
+
+	removed := 0
+
+	for _, cont := range containers {
+		// Only remove containers that look like test containers
+		shouldRemove := false
+
+		for _, name := range cont.Names {
+			if strings.Contains(name, "headscale-test-suite") ||
+				strings.Contains(name, "hs-") ||
+				strings.Contains(name, "ts-") ||
+				strings.Contains(name, "derp-") {
+				shouldRemove = true
+				break
+			}
+		}
+
+		if shouldRemove {
+			if removeContainerWithRetry(ctx, cli, cont.ID) {
+				removed++
+			}
+		}
+	}
+
+	if removed > 0 {
+		fmt.Printf("Removed %d stale test containers\n", removed)
+	}
+
+	return nil
+}
+
+const (
+	containerRemoveInitialInterval = 100 * time.Millisecond
+	containerRemoveMaxElapsedTime  = 2 * time.Second
+)
+
 // removeContainerWithRetry attempts to remove a container with exponential backoff retry logic.
 func removeContainerWithRetry(ctx context.Context, cli *client.Client, containerID string) bool {
-	maxRetries := 3
-	baseDelay := 100 * time.Millisecond
+	expBackoff := backoff.NewExponentialBackOff()
+	expBackoff.InitialInterval = containerRemoveInitialInterval
 
-	for attempt := range maxRetries {
+	_, err := backoff.Retry(ctx, func() (struct{}, error) {
 		err := cli.ContainerRemove(ctx, containerID, container.RemoveOptions{
 			Force: true,
 		})
-		if err == nil {
-			return true
+		if err != nil {
+			return struct{}{}, err
 		}
 
-		// If this is the last attempt, don't wait
-		if attempt == maxRetries-1 {
-			break
-		}
+		return struct{}{}, nil
+	}, backoff.WithBackOff(expBackoff), backoff.WithMaxElapsedTime(containerRemoveMaxElapsedTime))
 
-		// Wait with exponential backoff
-		delay := baseDelay * time.Duration(1<<attempt)
-		time.Sleep(delay)
-	}
-
-	return false
+	return err == nil
 }
 
 // pruneDockerNetworks removes unused Docker networks.
@@ -204,4 +316,111 @@ func cleanCacheVolume(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// cleanupSuccessfulTestArtifacts removes artifacts from successful test runs to save disk space.
+// This function removes large artifacts that are mainly useful for debugging failures:
+// - Database dumps (.db files)
+// - Profile data (pprof directories)
+// - MapResponse data (mapresponses directories)
+// - Prometheus metrics files
+//
+// It preserves:
+// - Log files (.log) which are small and useful for verification.
+func cleanupSuccessfulTestArtifacts(logsDir string, verbose bool) error {
+	entries, err := os.ReadDir(logsDir)
+	if err != nil {
+		return fmt.Errorf("failed to read logs directory: %w", err)
+	}
+
+	var (
+		removedFiles, removedDirs int
+		totalSize                 int64
+	)
+
+	for _, entry := range entries {
+		name := entry.Name()
+		fullPath := filepath.Join(logsDir, name)
+
+		if entry.IsDir() {
+			// Remove pprof and mapresponses directories (typically large)
+			// These directories contain artifacts from all containers in the test run
+			if name == "pprof" || name == "mapresponses" {
+				size, sizeErr := getDirSize(fullPath)
+				if sizeErr == nil {
+					totalSize += size
+				}
+
+				err := os.RemoveAll(fullPath)
+				if err != nil {
+					if verbose {
+						log.Printf("Warning: failed to remove directory %s: %v", name, err)
+					}
+				} else {
+					removedDirs++
+
+					if verbose {
+						log.Printf("Removed directory: %s/", name)
+					}
+				}
+			}
+		} else {
+			// Only process test-related files (headscale and tailscale)
+			if !strings.HasPrefix(name, "hs-") && !strings.HasPrefix(name, "ts-") {
+				continue
+			}
+
+			// Remove database, metrics, and status files, but keep logs
+			shouldRemove := strings.HasSuffix(name, ".db") ||
+				strings.HasSuffix(name, "_metrics.txt") ||
+				strings.HasSuffix(name, "_status.json")
+
+			if shouldRemove {
+				info, infoErr := entry.Info()
+				if infoErr == nil {
+					totalSize += info.Size()
+				}
+
+				err := os.Remove(fullPath)
+				if err != nil {
+					if verbose {
+						log.Printf("Warning: failed to remove file %s: %v", name, err)
+					}
+				} else {
+					removedFiles++
+
+					if verbose {
+						log.Printf("Removed file: %s", name)
+					}
+				}
+			}
+		}
+	}
+
+	if removedFiles > 0 || removedDirs > 0 {
+		const bytesPerMB = 1024 * 1024
+		log.Printf("Cleaned up %d files and %d directories (freed ~%.2f MB)",
+			removedFiles, removedDirs, float64(totalSize)/bytesPerMB)
+	}
+
+	return nil
+}
+
+// getDirSize calculates the total size of a directory.
+func getDirSize(path string) (int64, error) {
+	var size int64
+
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if !info.IsDir() {
+			size += info.Size()
+		}
+
+		return nil
+	})
+
+	return size, err
 }

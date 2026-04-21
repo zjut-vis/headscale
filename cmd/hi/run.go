@@ -19,7 +19,7 @@ type RunConfig struct {
 	FailFast      bool          `flag:"failfast,default=true,Stop on first test failure"`
 	UsePostgres   bool          `flag:"postgres,default=false,Use PostgreSQL instead of SQLite"`
 	GoVersion     string        `flag:"go-version,Go version to use (auto-detected from go.mod)"`
-	CleanBefore   bool          `flag:"clean-before,default=true,Clean resources before test"`
+	CleanBefore   bool          `flag:"clean-before,default=true,Clean stale resources before test"`
 	CleanAfter    bool          `flag:"clean-after,default=true,Clean resources after test"`
 	KeepOnFailure bool          `flag:"keep-on-failure,default=false,Keep containers on test failure"`
 	LogsDir       string        `flag:"logs-dir,default=control_logs,Control logs directory"`

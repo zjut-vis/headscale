@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +21,6 @@ import (
 func init() {
 	rootCmd.AddCommand(nodeCmd)
 	listNodesCmd.Flags().StringP("user", "u", "", "Filter by user")
-	listNodesCmd.Flags().BoolP("tags", "t", false, "Show tags")
 
 	listNodesCmd.Flags().StringP("namespace", "n", "", "User")
 	listNodesNamespaceFlag := listNodesCmd.Flags().Lookup("namespace")
@@ -72,26 +70,6 @@ func init() {
 		log.Fatal(err.Error())
 	}
 	nodeCmd.AddCommand(deleteNodeCmd)
-
-	moveNodeCmd.Flags().Uint64P("identifier", "i", 0, "Node identifier (ID)")
-
-	err = moveNodeCmd.MarkFlagRequired("identifier")
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-
-	moveNodeCmd.Flags().Uint64P("user", "u", 0, "New user")
-
-	moveNodeCmd.Flags().StringP("namespace", "n", "", "User")
-	moveNodeNamespaceFlag := moveNodeCmd.Flags().Lookup("namespace")
-	moveNodeNamespaceFlag.Deprecated = deprecateNamespaceMessage
-	moveNodeNamespaceFlag.Hidden = true
-
-	err = moveNodeCmd.MarkFlagRequired("user")
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-	nodeCmd.AddCommand(moveNodeCmd)
 
 	tagCmd.Flags().Uint64P("identifier", "i", 0, "Node identifier (ID)")
 	tagCmd.MarkFlagRequired("identifier")
@@ -168,10 +146,6 @@ var listNodesCmd = &cobra.Command{
 		if err != nil {
 			ErrorOutput(err, fmt.Sprintf("Error getting user: %s", err), output)
 		}
-		showTags, err := cmd.Flags().GetBool("tags")
-		if err != nil {
-			ErrorOutput(err, fmt.Sprintf("Error getting tags flag: %s", err), output)
-		}
 
 		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
@@ -194,7 +168,7 @@ var listNodesCmd = &cobra.Command{
 			SuccessOutput(response.GetNodes(), "", output)
 		}
 
-		tableData, err := nodesToPtables(user, showTags, response.GetNodes())
+		tableData, err := nodesToPtables(user, response.GetNodes())
 		if err != nil {
 			ErrorOutput(err, fmt.Sprintf("Error converting to table: %s", err), output)
 		}
@@ -240,10 +214,6 @@ var listNodeRoutesCmd = &cobra.Command{
 			)
 		}
 
-		if output != "" {
-			SuccessOutput(response.GetNodes(), "", output)
-		}
-
 		nodes := response.GetNodes()
 		if identifier != 0 {
 			for _, node := range response.GetNodes() {
@@ -257,6 +227,11 @@ var listNodeRoutesCmd = &cobra.Command{
 		nodes = lo.Filter(nodes, func(n *v1.Node, _ int) bool {
 			return (n.GetSubnetRoutes() != nil && len(n.GetSubnetRoutes()) > 0) || (n.GetApprovedRoutes() != nil && len(n.GetApprovedRoutes()) > 0) || (n.GetAvailableRoutes() != nil && len(n.GetAvailableRoutes()) > 0)
 		})
+
+		if output != "" {
+			SuccessOutput(nodes, "", output)
+			return
+		}
 
 		tableData, err := nodeRoutesToPtables(nodes)
 		if err != nil {
@@ -301,7 +276,8 @@ var expireNodeCmd = &cobra.Command{
 
 			return
 		}
-		expiryTime := time.Now()
+		now := time.Now()
+		expiryTime := now
 		if expiry != "" {
 			expiryTime, err = time.Parse(time.RFC3339, expiry)
 			if err != nil {
@@ -336,7 +312,11 @@ var expireNodeCmd = &cobra.Command{
 			)
 		}
 
-		SuccessOutput(response.GetNode(), "Node expired", output)
+		if now.Equal(expiryTime) || now.After(expiryTime) {
+			SuccessOutput(response.GetNode(), "Node expired", output)
+		} else {
+			SuccessOutput(response.GetNode(), "Node expiration updated", output)
+		}
 	},
 }
 
@@ -455,66 +435,6 @@ var deleteNodeCmd = &cobra.Command{
 	},
 }
 
-var moveNodeCmd = &cobra.Command{
-	Use:     "move",
-	Short:   "Move node to another user",
-	Aliases: []string{"mv"},
-	Run: func(cmd *cobra.Command, args []string) {
-		output, _ := cmd.Flags().GetString("output")
-
-		identifier, err := cmd.Flags().GetUint64("identifier")
-		if err != nil {
-			ErrorOutput(
-				err,
-				fmt.Sprintf("Error converting ID to integer: %s", err),
-				output,
-			)
-		}
-
-		user, err := cmd.Flags().GetUint64("user")
-		if err != nil {
-			ErrorOutput(
-				err,
-				fmt.Sprintf("Error getting user: %s", err),
-				output,
-			)
-		}
-
-		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
-		defer cancel()
-		defer conn.Close()
-
-		getRequest := &v1.GetNodeRequest{
-			NodeId: identifier,
-		}
-
-		_, err = client.GetNode(ctx, getRequest)
-		if err != nil {
-			ErrorOutput(
-				err,
-				"Error getting node: "+status.Convert(err).Message(),
-				output,
-			)
-		}
-
-		moveRequest := &v1.MoveNodeRequest{
-			NodeId: identifier,
-			User:   user,
-		}
-
-		moveResponse, err := client.MoveNode(ctx, moveRequest)
-		if err != nil {
-			ErrorOutput(
-				err,
-				"Error moving node: "+status.Convert(err).Message(),
-				output,
-			)
-		}
-
-		SuccessOutput(moveResponse.GetNode(), "Node moved to another user", output)
-	},
-}
-
 var backfillNodeIPsCmd = &cobra.Command{
 	Use:   "backfillips",
 	Short: "Backfill IPs missing from nodes",
@@ -561,7 +481,6 @@ be assigned to nodes.`,
 
 func nodesToPtables(
 	currentUser string,
-	showTags bool,
 	nodes []*v1.Node,
 ) (pterm.TableData, error) {
 	tableHeader := []string{
@@ -571,19 +490,13 @@ func nodesToPtables(
 		"MachineKey",
 		"NodeKey",
 		"User",
+		"Tags",
 		"IP addresses",
 		"Ephemeral",
 		"Last seen",
 		"Expiration",
 		"Connected",
 		"Expired",
-	}
-	if showTags {
-		tableHeader = append(tableHeader, []string{
-			"ForcedTags",
-			"InvalidTags",
-			"ValidTags",
-		}...)
 	}
 	tableData := pterm.TableData{tableHeader}
 
@@ -639,25 +552,17 @@ func nodesToPtables(
 			expired = pterm.LightRed("yes")
 		}
 
-		var forcedTags string
-		for _, tag := range node.GetForcedTags() {
-			forcedTags += "," + tag
+		// TODO(kradalby): as part of CLI rework, we should add the posibility to show "unusable" tags as mentioned in
+		// https://github.com/juanfont/headscale/issues/2981
+		var tagsBuilder strings.Builder
+
+		for _, tag := range node.GetTags() {
+			tagsBuilder.WriteString("\n" + tag)
 		}
-		forcedTags = strings.TrimLeft(forcedTags, ",")
-		var invalidTags string
-		for _, tag := range node.GetInvalidTags() {
-			if !slices.Contains(node.GetForcedTags(), tag) {
-				invalidTags += "," + pterm.LightRed(tag)
-			}
-		}
-		invalidTags = strings.TrimLeft(invalidTags, ",")
-		var validTags string
-		for _, tag := range node.GetValidTags() {
-			if !slices.Contains(node.GetForcedTags(), tag) {
-				validTags += "," + pterm.LightGreen(tag)
-			}
-		}
-		validTags = strings.TrimLeft(validTags, ",")
+
+		tags := tagsBuilder.String()
+
+		tags = strings.TrimLeft(tags, "\n")
 
 		var user string
 		if currentUser == "" || (currentUser == node.GetUser().GetName()) {
@@ -684,15 +589,13 @@ func nodesToPtables(
 			machineKey.ShortString(),
 			nodeKey.ShortString(),
 			user,
+			tags,
 			strings.Join([]string{IPV4Address, IPV6Address}, ", "),
 			strconv.FormatBool(ephemeral),
 			lastSeenTime,
 			expiryTime,
 			online,
 			expired,
-		}
-		if showTags {
-			nodeData = append(nodeData, []string{forcedTags, invalidTags, validTags}...)
 		}
 		tableData = append(
 			tableData,
@@ -719,9 +622,9 @@ func nodeRoutesToPtables(
 		nodeData := []string{
 			strconv.FormatUint(node.GetId(), util.Base10),
 			node.GetGivenName(),
-			strings.Join(node.GetApprovedRoutes(), ", "),
-			strings.Join(node.GetAvailableRoutes(), ", "),
-			strings.Join(node.GetSubnetRoutes(), ", "),
+			strings.Join(node.GetApprovedRoutes(), "\n"),
+			strings.Join(node.GetAvailableRoutes(), "\n"),
+			strings.Join(node.GetSubnetRoutes(), "\n"),
 		}
 		tableData = append(
 			tableData,

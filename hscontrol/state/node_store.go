@@ -15,11 +15,6 @@ import (
 )
 
 const (
-	batchSize    = 100
-	batchTimeout = 500 * time.Millisecond
-)
-
-const (
 	put             = 1
 	del             = 2
 	update          = 3
@@ -92,9 +87,12 @@ type NodeStore struct {
 
 	peersFunc  PeersFunc
 	writeQueue chan work
+
+	batchSize    int
+	batchTimeout time.Duration
 }
 
-func NewNodeStore(allNodes types.Nodes, peersFunc PeersFunc) *NodeStore {
+func NewNodeStore(allNodes types.Nodes, peersFunc PeersFunc, batchSize int, batchTimeout time.Duration) *NodeStore {
 	nodes := make(map[types.NodeID]types.Node, len(allNodes))
 	for _, n := range allNodes {
 		nodes[n.ID] = *n
@@ -102,7 +100,9 @@ func NewNodeStore(allNodes types.Nodes, peersFunc PeersFunc) *NodeStore {
 	snap := snapshotFromNodes(nodes, peersFunc)
 
 	store := &NodeStore{
-		peersFunc: peersFunc,
+		peersFunc:    peersFunc,
+		batchSize:    batchSize,
+		batchTimeout: batchTimeout,
 	}
 	store.data.Store(&snap)
 
@@ -249,9 +249,10 @@ func (s *NodeStore) Stop() {
 
 // processWrite processes the write queue in batches.
 func (s *NodeStore) processWrite() {
-	c := time.NewTicker(batchTimeout)
+	c := time.NewTicker(s.batchTimeout)
 	defer c.Stop()
-	batch := make([]work, 0, batchSize)
+
+	batch := make([]work, 0, s.batchSize)
 
 	for {
 		select {
@@ -264,17 +265,19 @@ func (s *NodeStore) processWrite() {
 				return
 			}
 			batch = append(batch, w)
-			if len(batch) >= batchSize {
+			if len(batch) >= s.batchSize {
 				s.applyBatch(batch)
 				batch = batch[:0]
-				c.Reset(batchTimeout)
+
+				c.Reset(s.batchTimeout)
 			}
 		case <-c.C:
 			if len(batch) != 0 {
 				s.applyBatch(batch)
 				batch = batch[:0]
 			}
-			c.Reset(batchTimeout)
+
+			c.Reset(s.batchTimeout)
 		}
 	}
 }
@@ -405,7 +408,7 @@ func snapshotFromNodes(nodes map[types.NodeID]types.Node, peersFunc PeersFunc) S
 	// Build nodesByUser, nodesByNodeKey, and nodesByMachineKey maps
 	for _, n := range nodes {
 		nodeView := n.View()
-		userID := types.UserID(n.UserID)
+		userID := n.TypedUserID()
 
 		newSnap.nodesByUser[userID] = append(newSnap.nodesByUser[userID], nodeView)
 		newSnap.nodesByNodeKey[n.NodeKey] = nodeView
@@ -506,15 +509,27 @@ func (s *NodeStore) DebugString() string {
 	sb.WriteString(fmt.Sprintf("Users with Nodes: %d\n", len(snapshot.nodesByUser)))
 	sb.WriteString("\n")
 
-	// User distribution
-	sb.WriteString("Nodes by User:\n")
+	// User distribution (shows internal UserID tracking, not display owner)
+	sb.WriteString("Nodes by Internal User ID:\n")
 	for userID, nodes := range snapshot.nodesByUser {
 		if len(nodes) > 0 {
 			userName := "unknown"
+			taggedCount := 0
 			if len(nodes) > 0 && nodes[0].Valid() {
-				userName = nodes[0].User().Name
+				userName = nodes[0].User().Name()
+				// Count tagged nodes (which have UserID set but are owned by "tagged-devices")
+				for _, n := range nodes {
+					if n.IsTagged() {
+						taggedCount++
+					}
+				}
 			}
-			sb.WriteString(fmt.Sprintf("  - User %d (%s): %d nodes\n", userID, userName, len(nodes)))
+
+			if taggedCount > 0 {
+				sb.WriteString(fmt.Sprintf("  - User %d (%s): %d nodes (%d tagged)\n", userID, userName, len(nodes), taggedCount))
+			} else {
+				sb.WriteString(fmt.Sprintf("  - User %d (%s): %d nodes\n", userID, userName, len(nodes)))
+			}
 		}
 	}
 	sb.WriteString("\n")

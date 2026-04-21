@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/go-json-experiment/json"
-
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/prometheus/common/model"
@@ -33,6 +32,19 @@ var policyJSONOpts = []json.Options{
 const Wildcard = Asterix(0)
 
 var ErrAutogroupSelfRequiresPerNodeResolution = errors.New("autogroup:self requires per-node resolution and cannot be resolved in this context")
+
+var ErrCircularReference = errors.New("circular reference detected")
+
+var ErrUndefinedTagReference = errors.New("references undefined tag")
+
+// SSH validation errors.
+var (
+	ErrSSHTagSourceToUserDest             = errors.New("tags in SSH source cannot access user-owned devices")
+	ErrSSHUserDestRequiresSameUser        = errors.New("user destination requires source to contain only that same user")
+	ErrSSHAutogroupSelfRequiresUserSource = errors.New("autogroup:self destination requires source to contain only users or groups, not tags or autogroup:tagged")
+	ErrSSHTagSourceToAutogroupMember      = errors.New("tags in SSH source cannot access autogroup:member (user-owned devices)")
+	ErrSSHWildcardDestination             = errors.New("wildcard (*) is not supported as SSH destination")
+)
 
 type Asterix int
 
@@ -201,12 +213,17 @@ func (u Username) Resolve(_ *Policy, users types.Users, nodes views.Slice[types.
 	}
 
 	for _, node := range nodes.All() {
-		// Skip tagged nodes
+		// Skip tagged nodes - they are identified by tags, not users
 		if node.IsTagged() {
 			continue
 		}
 
-		if node.User().ID == user.ID {
+		// Skip nodes without a user (defensive check for tests)
+		if !node.User().Valid() {
+			continue
+		}
+
+		if node.User().ID() == user.ID {
 			node.AppendToIPSet(&ips)
 		}
 	}
@@ -298,34 +315,10 @@ func (t *Tag) UnmarshalJSON(b []byte) error {
 func (t Tag) Resolve(p *Policy, users types.Users, nodes views.Slice[types.NodeView]) (*netipx.IPSet, error) {
 	var ips netipx.IPSetBuilder
 
-	// TODO(kradalby): This is currently resolved twice, and should be resolved once.
-	// It is added temporary until we sort out the story on how and when we resolve tags
-	// from the three places they can be "approved":
-	// - As part of a PreAuthKey (handled in HasTag)
-	// - As part of ForcedTags (set via CLI) (handled in HasTag)
-	// - As part of HostInfo.RequestTags and approved by policy (this is happening here)
-	// Part of #2417
-	tagMap, err := resolveTagOwners(p, users, nodes)
-	if err != nil {
-		return nil, err
-	}
-
 	for _, node := range nodes.All() {
-		// Check if node has this tag in all tags (ForcedTags + AuthKey.Tags)
-		if slices.Contains(node.Tags(), string(t)) {
+		// Check if node has this tag
+		if node.HasTag(string(t)) {
 			node.AppendToIPSet(&ips)
-		}
-
-		// TODO(kradalby): remove as part of #2417, see comment above
-		if tagMap != nil {
-			if tagips, ok := tagMap[t]; ok && node.InIPSet(tagips) && node.Hostinfo().Valid() {
-				for _, tag := range node.RequestTagsSlice().All() {
-					if tag == string(t) {
-						node.AppendToIPSet(&ips)
-						break
-					}
-				}
-			}
 		}
 	}
 
@@ -333,6 +326,10 @@ func (t Tag) Resolve(p *Policy, users types.Users, nodes views.Slice[types.NodeV
 }
 
 func (t Tag) CanBeAutoApprover() bool {
+	return true
+}
+
+func (t Tag) CanBeTagOwner() bool {
 	return true
 }
 
@@ -532,61 +529,26 @@ func (ag AutoGroup) Resolve(p *Policy, users types.Users, nodes views.Slice[type
 		return util.TheInternet(), nil
 
 	case AutoGroupMember:
-		// autogroup:member represents all untagged devices in the tailnet.
-		tagMap, err := resolveTagOwners(p, users, nodes)
-		if err != nil {
-			return nil, err
-		}
-
 		for _, node := range nodes.All() {
 			// Skip if node is tagged
 			if node.IsTagged() {
 				continue
 			}
 
-			// Skip if node has any allowed requested tags
-			hasAllowedTag := false
-			if node.RequestTagsSlice().Len() != 0 {
-				for _, tag := range node.RequestTagsSlice().All() {
-					if _, ok := tagMap[Tag(tag)]; ok {
-						hasAllowedTag = true
-						break
-					}
-				}
-			}
-			if hasAllowedTag {
-				continue
-			}
-
-			// Node is a member if it has no forced tags and no allowed requested tags
+			// Node is a member if it is not tagged
 			node.AppendToIPSet(&build)
 		}
 
 		return build.IPSet()
 
 	case AutoGroupTagged:
-		// autogroup:tagged represents all devices with a tag in the tailnet.
-		tagMap, err := resolveTagOwners(p, users, nodes)
-		if err != nil {
-			return nil, err
-		}
-
 		for _, node := range nodes.All() {
 			// Include if node is tagged
-			if node.IsTagged() {
-				node.AppendToIPSet(&build)
+			if !node.IsTagged() {
 				continue
 			}
 
-			// Include if node has any allowed requested tags
-			if node.RequestTagsSlice().Len() != 0 {
-				for _, tag := range node.RequestTagsSlice().All() {
-					if _, ok := tagMap[Tag(tag)]; ok {
-						node.AppendToIPSet(&build)
-						break
-					}
-				}
-			}
+			node.AppendToIPSet(&build)
 		}
 
 		return build.IPSet()
@@ -910,6 +872,7 @@ func (ve *AutoApproverEnc) UnmarshalJSON(b []byte) error {
 type Owner interface {
 	CanBeTagOwner() bool
 	UnmarshalJSON([]byte) error
+	String() string
 }
 
 // OwnerEnc is used to deserialize a Owner.
@@ -958,6 +921,8 @@ func (o Owners) MarshalJSON() ([]byte, error) {
 			owners[i] = string(*v)
 		case *Group:
 			owners[i] = string(*v)
+		case *Tag:
+			owners[i] = string(*v)
 		default:
 			return nil, fmt.Errorf("unknown owner type: %T", v)
 		}
@@ -972,6 +937,8 @@ func parseOwner(s string) (Owner, error) {
 		return ptr.To(Username(s)), nil
 	case isGroup(s):
 		return ptr.To(Group(s)), nil
+	case isTag(s):
+		return ptr.To(Tag(s)), nil
 	}
 
 	return nil, fmt.Errorf(`Invalid Owner %q. An alias must be one of the following types:
@@ -1007,7 +974,7 @@ func (g Groups) Contains(group *Group) error {
 // with "group:". If any group name is invalid, an error is returned.
 func (g *Groups) UnmarshalJSON(b []byte) error {
 	// First unmarshal as a generic map to validate group names first
-	var rawMap map[string]interface{}
+	var rawMap map[string]any
 	if err := json.Unmarshal(b, &rawMap); err != nil {
 		return err
 	}
@@ -1024,7 +991,7 @@ func (g *Groups) UnmarshalJSON(b []byte) error {
 	rawGroups := make(map[string][]string)
 	for key, value := range rawMap {
 		switch v := value.(type) {
-		case []interface{}:
+		case []any:
 			// Convert []interface{} to []string
 			var stringSlice []string
 			for _, item := range v {
@@ -1129,6 +1096,8 @@ func (to TagOwners) MarshalJSON() ([]byte, error) {
 				ownerStrs[i] = string(*v)
 			case *Group:
 				ownerStrs[i] = string(*v)
+			case *Tag:
+				ownerStrs[i] = string(*v)
 			default:
 				return nil, fmt.Errorf("unknown owner type: %T", v)
 			}
@@ -1155,41 +1124,6 @@ func (to TagOwners) Contains(tagOwner *Tag) error {
 	}
 
 	return fmt.Errorf(`Tag %q is not defined in the Policy, please define or remove the reference to it`, tagOwner)
-}
-
-// resolveTagOwners resolves the TagOwners to a map of Tag to netipx.IPSet.
-// The resulting map can be used to quickly look up the IPSet for a given Tag.
-// It is intended for internal use in a PolicyManager.
-func resolveTagOwners(p *Policy, users types.Users, nodes views.Slice[types.NodeView]) (map[Tag]*netipx.IPSet, error) {
-	if p == nil {
-		return nil, nil
-	}
-
-	ret := make(map[Tag]*netipx.IPSet)
-
-	for tag, owners := range p.TagOwners {
-		var ips netipx.IPSetBuilder
-
-		for _, owner := range owners {
-			o, ok := owner.(Alias)
-			if !ok {
-				// Should never happen
-				return nil, fmt.Errorf("owner %v is not an Alias", owner)
-			}
-			// If it does not resolve, that means the tag is not associated with any IP addresses.
-			resolved, _ := o.Resolve(p, users, nodes)
-			ips.AddSet(resolved)
-		}
-
-		ipSet, err := ips.IPSet()
-		if err != nil {
-			return nil, err
-		}
-
-		ret[tag] = ipSet
-	}
-
-	return ret, nil
 }
 
 type AutoApproverPolicy struct {
@@ -1688,6 +1622,63 @@ func validateAutogroupForSSHUser(user *AutoGroup) error {
 	return nil
 }
 
+// validateSSHSrcDstCombination validates that SSH source/destination combinations
+// follow Tailscale's security model:
+// - Destination can be: tags, autogroup:self (if source is users/groups), or same-user
+// - Tags/autogroup:tagged CANNOT SSH to user destinations
+// - Username destinations require the source to be that same single user only.
+func validateSSHSrcDstCombination(sources SSHSrcAliases, destinations SSHDstAliases) error {
+	// Categorize source types
+	srcHasTaggedEntities := false
+	srcHasGroups := false
+	srcUsernames := make(map[string]bool)
+
+	for _, src := range sources {
+		switch v := src.(type) {
+		case *Tag:
+			srcHasTaggedEntities = true
+		case *AutoGroup:
+			if v.Is(AutoGroupTagged) {
+				srcHasTaggedEntities = true
+			} else if v.Is(AutoGroupMember) {
+				srcHasGroups = true // autogroup:member is like a group of users
+			}
+		case *Group:
+			srcHasGroups = true
+		case *Username:
+			srcUsernames[string(*v)] = true
+		}
+	}
+
+	// Check destinations against source constraints
+	for _, dst := range destinations {
+		switch v := dst.(type) {
+		case *Username:
+			// Rule: Tags/autogroup:tagged CANNOT SSH to user destinations
+			if srcHasTaggedEntities {
+				return fmt.Errorf("%w (%s); use autogroup:tagged or specific tags as destinations instead",
+					ErrSSHTagSourceToUserDest, *v)
+			}
+			// Rule: Username destination requires source to be that same single user only
+			if srcHasGroups || len(srcUsernames) != 1 || !srcUsernames[string(*v)] {
+				return fmt.Errorf("%w %q; use autogroup:self instead for same-user SSH access",
+					ErrSSHUserDestRequiresSameUser, *v)
+			}
+		case *AutoGroup:
+			// Rule: autogroup:self requires source to NOT contain tags
+			if v.Is(AutoGroupSelf) && srcHasTaggedEntities {
+				return ErrSSHAutogroupSelfRequiresUserSource
+			}
+			// Rule: autogroup:member (user-owned devices) cannot be accessed by tagged entities
+			if v.Is(AutoGroupMember) && srcHasTaggedEntities {
+				return ErrSSHTagSourceToAutogroupMember
+			}
+		}
+	}
+
+	return nil
+}
+
 // validate reports if there are any errors in a policy after
 // the unmarshaling process.
 // It runs through all rules and checks if there are any inconsistencies
@@ -1829,6 +1820,12 @@ func (p *Policy) validate() error {
 				}
 			}
 		}
+
+		// Validate SSH source/destination combinations follow Tailscale's security model
+		err := validateSSHSrcDstCombination(ssh.Sources, ssh.Destinations)
+		if err != nil {
+			errs = append(errs, err)
+		}
 	}
 
 	for _, tagOwners := range p.TagOwners {
@@ -1839,8 +1836,21 @@ func (p *Policy) validate() error {
 				if err := p.Groups.Contains(g); err != nil {
 					errs = append(errs, err)
 				}
+			case *Tag:
+				t := tagOwner
+
+				err := p.TagOwners.Contains(t)
+				if err != nil {
+					errs = append(errs, err)
+				}
 			}
 		}
+	}
+
+	// Validate tag ownership chains for circular references and undefined tags.
+	_, err := flattenTagOwners(p.TagOwners)
+	if err != nil {
+		errs = append(errs, err)
 	}
 
 	for _, approvers := range p.AutoApprovers.Routes {
@@ -1948,15 +1958,12 @@ func (a *SSHDstAliases) UnmarshalJSON(b []byte) error {
 	*a = make([]Alias, len(aliases))
 	for i, alias := range aliases {
 		switch alias.Alias.(type) {
-		case *Username, *Tag, *AutoGroup, *Host,
-			// Asterix and Group is actually not supposed to be supported,
-			// however we do not support autogroups at the moment
-			// so we will leave it in as there is no other option
-			// to dynamically give all access
-			// https://tailscale.com/kb/1193/tailscale-ssh#dst
-			// TODO(kradalby): remove this when we support autogroup:tagged and autogroup:member
-			Asterix:
+		case *Username, *Tag, *AutoGroup, *Host:
 			(*a)[i] = alias.Alias
+		case Asterix:
+			return fmt.Errorf("%w; use 'autogroup:member' for user-owned devices, "+
+				"'autogroup:tagged' for tagged devices, or specific tags/users",
+				ErrSSHWildcardDestination)
 		default:
 			return fmt.Errorf(
 				"alias %T is not supported for SSH destination",
@@ -1986,6 +1993,8 @@ func (a SSHDstAliases) MarshalJSON() ([]byte, error) {
 		case *Host:
 			aliases[i] = string(*v)
 		case Asterix:
+			// Marshal wildcard as "*" so it gets rejected during unmarshal
+			// with a proper error message explaining alternatives
 			aliases[i] = "*"
 		default:
 			return nil, fmt.Errorf("unknown SSH destination alias type: %T", v)
